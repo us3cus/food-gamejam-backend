@@ -7,7 +7,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
     "start:dev": "ts-node src/main.ts",
-    "test": "npm run build"
+    "test": "npm run build && node --test test/*.test.js",
+    "lint": "oxlint src"
   },
   "keywords": [],
   "author": "",
@@ -21,6 +22,7 @@
   "devDependencies": {
     "@nestjs/platform-express": "^11.1.28",
     "@types/node": "^26.1.1",
+    "oxlint": "^1.73.0",
     "ts-node": "^10.9.2",
     "typescript": "^7.0.2"
   }

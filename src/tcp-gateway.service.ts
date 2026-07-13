@@ -6,6 +6,17 @@ const MAX_LINE_BYTES = 1_048_576;
 const MAX_PACKETS_PER_SECOND = 30;
 const MAX_NAME_LENGTH = 32;
 const LOBBY_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const ITEM_SPAWN_INTERVAL_MS = 2_500;
+const MAX_ITEMS = 6;
+const PROJECTILE_TTL_MS = 6_000;
+
+type FoodType = 'tomato' | 'cheese' | 'pumpkin' | 'watermelon';
+const FOOD: Record<FoodType, { weight: number; damage: number; aoe: boolean }> = {
+  tomato: { weight: 3, damage: 1, aoe: false },
+  cheese: { weight: 3, damage: 1, aoe: false },
+  pumpkin: { weight: 2, damage: 2, aoe: false },
+  watermelon: { weight: 1, damage: 1, aoe: true },
+};
 
 type Packet = { type?: unknown; request_id?: unknown; payload?: unknown };
 type Settings = { max_players: number; round_time: number; wins_to_match: number };
@@ -34,13 +45,36 @@ type MatchPlayer = {
   velocity: VectorState;
   yaw: number;
   health: number;
+  heldFood: FoodType | null;
   lastHitAt: number;
+};
+type FoodItemState = {
+  id: string;
+  foodType: FoodType;
+  position: VectorState;
+  pickupAvailableAt: number;
+  bonked: boolean;
+};
+type ProjectileState = {
+  id: string;
+  sourceId: string;
+  foodType: FoodType;
+  origin: VectorState;
+  velocity: VectorState;
+  knockbackMultiplier: number;
+  damage: number;
+  aoe: boolean;
+  createdAt: number;
+  hitTargets: Set<string>;
 };
 type Match = {
   id: string;
   lobbyId: string;
   hostId: string;
   players: Map<string, MatchPlayer>;
+  items: Map<string, FoodItemState>;
+  projectiles: Map<string, ProjectileState>;
+  nextItemSpawnAt: number;
 };
 
 @Injectable()
@@ -111,6 +145,13 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
       case 'game.input': return this.gameInput(player, payload, requestId);
       case 'game.hit': return this.gameHit(player, payload, requestId);
       case 'game.round.reset': return this.resetRound(player, payload, requestId);
+      case 'game.item.pickup': return this.pickupItem(player, payload, requestId);
+      case 'game.item.drop': return this.dropItem(player, payload, requestId);
+      case 'game.item.hit': return this.itemHit(player, payload, requestId);
+      case 'game.item.despawn': return this.despawnItem(player, payload, requestId);
+      case 'game.projectile.spawn': return this.spawnProjectile(player, payload, requestId);
+      case 'game.projectile.hit': return this.projectileHit(player, payload, requestId);
+      case 'game.projectile.despawn': return this.despawnProjectile(player, payload, requestId);
       default: return this.fail(player, 'UNKNOWN_TYPE', 'Unknown packet type', requestId);
     }
   }
@@ -198,6 +239,7 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
       seed: randomInt(1, 2_147_483_647),
       settings: lobby.settings,
       players: this.matchPlayers(match),
+      items: this.matchItems(match),
     });
     this.broadcastGameState(match);
   }
@@ -252,6 +294,155 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
+  private pickupItem(player: Player, payload: Record<string, unknown>, requestId: unknown) {
+    const match = this.matchFor(player, payload.match_id);
+    if (!match) return this.fail(player, 'NOT_IN_MATCH', 'Player is not in this match', requestId);
+    const state = match.players.get(player.id)!;
+    const itemId = typeof payload.item_id === 'string' ? payload.item_id : '';
+    const item = match.items.get(itemId);
+    if (!item) return this.fail(player, 'ITEM_NOT_FOUND', 'Item does not exist', requestId);
+    if (state.heldFood) return this.fail(player, 'ALREADY_HOLDING_ITEM', 'Player already holds food', requestId);
+    if (Date.now() < item.pickupAvailableAt) return this.fail(player, 'ITEM_PICKUP_DELAY', 'Item cannot be picked up yet', requestId);
+    if (this.distanceXZ(state.position, item.position) > 1.75) return this.fail(player, 'ITEM_TOO_FAR', 'Item is too far away', requestId);
+
+    match.items.delete(item.id);
+    state.heldFood = item.foodType;
+    this.broadcastMatch(match, 'game.item.picked', {
+      match_id: match.id,
+      item_id: item.id,
+      player_id: state.id,
+      food_type: item.foodType,
+    });
+  }
+
+  private dropItem(player: Player, payload: Record<string, unknown>, requestId: unknown) {
+    const match = this.matchFor(player, payload.match_id);
+    if (!match) return this.fail(player, 'NOT_IN_MATCH', 'Player is not in this match', requestId);
+    const state = match.players.get(player.id)!;
+    if (!state.heldFood) return this.fail(player, 'NOT_HOLDING_ITEM', 'Player does not hold food', requestId);
+    if (match.items.size >= MAX_ITEMS) return this.fail(player, 'ITEM_LIMIT', 'Maximum item count reached', requestId);
+    const position = this.vector(payload.position);
+    if (!position) return this.fail(player, 'INVALID_POSITION', 'Invalid drop position', requestId);
+    if (this.distance(state.position, position) > 3) return this.fail(player, 'DROP_TOO_FAR', 'Drop position is too far away', requestId);
+
+    const foodType = state.heldFood;
+    state.heldFood = null;
+    const item = this.createItem(match, foodType, {
+      x: this.clamp(position.x, -10, 10),
+      y: this.clamp(position.y, 0.1, 2),
+      z: this.clamp(position.z, -10, 10),
+    }, 750);
+    this.broadcastItemSpawn(match, item);
+  }
+
+  private itemHit(player: Player, payload: Record<string, unknown>, requestId: unknown) {
+    const match = this.matchFor(player, payload.match_id);
+    if (!match) return this.fail(player, 'NOT_IN_MATCH', 'Player is not in this match', requestId);
+    const itemId = typeof payload.item_id === 'string' ? payload.item_id : '';
+    const targetId = typeof payload.target_id === 'string' ? payload.target_id : '';
+    const item = match.items.get(itemId);
+    const target = match.players.get(targetId);
+    const knockback = this.vector(payload.knockback);
+    if (!item) return this.fail(player, 'ITEM_NOT_FOUND', 'Item does not exist', requestId);
+    if (item.bonked) return this.fail(player, 'ITEM_ALREADY_BONKED', 'Item already caused damage', requestId);
+    if (!target || target.id !== player.id) return this.fail(player, 'INVALID_TARGET', 'Hit must be reported by its target', requestId);
+    if (target.health <= 0) return this.fail(player, 'TARGET_DEAD', 'Target is already dead', requestId);
+    if (this.distanceXZ(target.position, item.position) > 1.75) return this.fail(player, 'ITEM_TOO_FAR', 'Item is too far from target', requestId);
+    if (!knockback) return this.fail(player, 'INVALID_KNOCKBACK', 'Invalid knockback vector', requestId);
+
+    item.bonked = true;
+    target.health = Math.max(0, target.health - 1);
+    this.broadcastMatch(match, 'game.hit', {
+      match_id: match.id,
+      source_id: '',
+      item_id: item.id,
+      target_id: target.id,
+      damage: 1,
+      health: target.health,
+      knockback: this.clampVector(knockback, -20, 20),
+    });
+  }
+
+  private despawnItem(player: Player, payload: Record<string, unknown>, requestId: unknown) {
+    const match = this.matchFor(player, payload.match_id);
+    if (!match) return this.fail(player, 'NOT_IN_MATCH', 'Player is not in this match', requestId);
+    if (match.hostId !== player.id) return this.fail(player, 'NOT_HOST', 'Only the host can despawn items', requestId);
+    const itemId = typeof payload.item_id === 'string' ? payload.item_id : '';
+    if (!match.items.delete(itemId)) return this.fail(player, 'ITEM_NOT_FOUND', 'Item does not exist', requestId);
+    this.broadcastMatch(match, 'game.item.despawn', { match_id: match.id, item_id: itemId });
+  }
+
+  private spawnProjectile(player: Player, payload: Record<string, unknown>, requestId: unknown) {
+    const match = this.matchFor(player, payload.match_id);
+    if (!match) return this.fail(player, 'NOT_IN_MATCH', 'Player is not in this match', requestId);
+    const state = match.players.get(player.id)!;
+    if (!state.heldFood) return this.fail(player, 'NOT_HOLDING_ITEM', 'Player does not hold food', requestId);
+    if (payload.food_type !== state.heldFood) return this.fail(player, 'INVALID_FOOD_TYPE', 'Food type does not match held food', requestId);
+    const origin = this.vector(payload.origin);
+    const velocity = this.vector(payload.velocity);
+    const multiplier = this.finiteNumber(payload.knockback_multiplier);
+    if (!origin || !velocity) return this.fail(player, 'INVALID_PROJECTILE', 'Invalid projectile vectors', requestId);
+    if (this.distance(state.position, origin) > 3.5) return this.fail(player, 'ORIGIN_TOO_FAR', 'Projectile origin is too far away', requestId);
+    if (this.vectorLength(velocity) > 40) return this.fail(player, 'VELOCITY_TOO_HIGH', 'Projectile velocity is too high', requestId);
+    if (multiplier === undefined) return this.fail(player, 'INVALID_KNOCKBACK_MULTIPLIER', 'Invalid knockback multiplier', requestId);
+
+    const foodType = state.heldFood;
+    const definition = FOOD[foodType];
+    const projectile: ProjectileState = {
+      id: randomUUID(),
+      sourceId: state.id,
+      foodType,
+      origin: this.clampVector(origin, -20, 20),
+      velocity: this.clampVector(velocity, -40, 40),
+      knockbackMultiplier: this.clamp(multiplier, 1, 1.5),
+      damage: definition.damage,
+      aoe: definition.aoe,
+      createdAt: Date.now(),
+      hitTargets: new Set(),
+    };
+    state.heldFood = null;
+    match.projectiles.set(projectile.id, projectile);
+    this.broadcastMatch(match, 'game.projectile.spawn', this.projectilePayload(match, projectile));
+  }
+
+  private projectileHit(player: Player, payload: Record<string, unknown>, requestId: unknown) {
+    const match = this.matchFor(player, payload.match_id);
+    if (!match) return this.fail(player, 'NOT_IN_MATCH', 'Player is not in this match', requestId);
+    const projectileId = typeof payload.projectile_id === 'string' ? payload.projectile_id : '';
+    const targetId = typeof payload.target_id === 'string' ? payload.target_id : '';
+    const projectile = match.projectiles.get(projectileId);
+    const target = match.players.get(targetId);
+    const knockback = this.vector(payload.knockback);
+    if (!projectile) return this.fail(player, 'PROJECTILE_NOT_FOUND', 'Projectile does not exist', requestId);
+    if (projectile.sourceId !== player.id) return this.fail(player, 'NOT_PROJECTILE_OWNER', 'Only projectile owner can report hits', requestId);
+    if (!target || target.health <= 0) return this.fail(player, 'INVALID_TARGET', 'Target does not exist or is dead', requestId);
+    if (projectile.hitTargets.has(target.id)) return this.fail(player, 'TARGET_ALREADY_HIT', 'Projectile already hit this target', requestId);
+    if (!projectile.aoe && projectile.hitTargets.size > 0) return this.fail(player, 'PROJECTILE_ALREADY_HIT', 'Projectile can hit only one target', requestId);
+    if (!knockback) return this.fail(player, 'INVALID_KNOCKBACK', 'Invalid knockback vector', requestId);
+
+    projectile.hitTargets.add(target.id);
+    target.health = Math.max(0, target.health - projectile.damage);
+    this.broadcastMatch(match, 'game.hit', {
+      match_id: match.id,
+      source_id: projectile.sourceId,
+      projectile_id: projectile.id,
+      target_id: target.id,
+      damage: projectile.damage,
+      health: target.health,
+      knockback: this.clampVector(knockback, -20, 20),
+    });
+  }
+
+  private despawnProjectile(player: Player, payload: Record<string, unknown>, requestId: unknown) {
+    const match = this.matchFor(player, payload.match_id);
+    if (!match) return this.fail(player, 'NOT_IN_MATCH', 'Player is not in this match', requestId);
+    const projectileId = typeof payload.projectile_id === 'string' ? payload.projectile_id : '';
+    const projectile = match.projectiles.get(projectileId);
+    if (!projectile) return this.fail(player, 'PROJECTILE_NOT_FOUND', 'Projectile does not exist', requestId);
+    if (projectile.sourceId !== player.id) return this.fail(player, 'NOT_PROJECTILE_OWNER', 'Only projectile owner can despawn it', requestId);
+    this.removeProjectile(match, projectile.id);
+  }
+
   private resetRound(player: Player, payload: Record<string, unknown>, requestId: unknown) {
     const match = this.matchFor(player, payload.match_id);
     if (!match) return this.fail(player, 'NOT_IN_MATCH', 'Player is not in this match', requestId);
@@ -260,11 +451,18 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
       state.position = this.spawnPosition(state.spawnSlot);
       state.velocity = { x: 0, y: 0, z: 0 };
       state.health = 3;
+      state.heldFood = null;
+      state.lastHitAt = 0;
     }
+    match.items.clear();
+    match.projectiles.clear();
+    const item = this.createItem(match);
+    match.nextItemSpawnAt = Date.now() + ITEM_SPAWN_INTERVAL_MS;
     this.broadcastMatch(match, 'game.round.started', {
       match_id: match.id,
       reset_match: payload.reset_match === true,
       players: this.matchPlayers(match),
+      items: [this.itemPayload(match, item)],
     });
   }
 
@@ -331,7 +529,7 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
   }
 
   private createMatch(lobby: Lobby): Match {
-    const match: Match = { id: randomUUID(), lobbyId: lobby.id, hostId: lobby.hostId, players: new Map() };
+    const match: Match = { id: randomUUID(), lobbyId: lobby.id, hostId: lobby.hostId, players: new Map(), items: new Map(), projectiles: new Map(), nextItemSpawnAt: Date.now() + ITEM_SPAWN_INTERVAL_MS };
     [...lobby.players.values()].forEach((member, spawnSlot) => match.players.set(member.id, {
       id: member.id,
       name: member.name,
@@ -340,8 +538,10 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
       velocity: { x: 0, y: 0, z: 0 },
       yaw: spawnSlot === 0 ? -Math.PI / 2 : Math.PI / 2,
       health: 3,
+      heldFood: null,
       lastHitAt: 0,
     }));
+    this.createItem(match);
     return match;
   }
 
@@ -363,11 +563,24 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
       velocity: state.velocity,
       yaw: state.yaw,
       health: state.health,
+      held_food: state.heldFood ?? '',
     }));
   }
 
-  private broadcastGameStates() { for (const match of this.matches.values()) this.broadcastGameState(match); }
-  private broadcastGameState(match: Match) { this.broadcastMatch(match, 'game.state', { match_id: match.id, server_time: Date.now(), players: this.matchPlayers(match) }); }
+  private broadcastGameStates() {
+    const now = Date.now();
+    for (const match of this.matches.values()) {
+      if (now >= match.nextItemSpawnAt) {
+        match.nextItemSpawnAt = now + ITEM_SPAWN_INTERVAL_MS;
+        if (match.items.size < MAX_ITEMS) this.broadcastItemSpawn(match, this.createItem(match));
+      }
+      for (const projectile of match.projectiles.values()) {
+        if (now - projectile.createdAt >= PROJECTILE_TTL_MS) this.removeProjectile(match, projectile.id);
+      }
+      this.broadcastGameState(match);
+    }
+  }
+  private broadcastGameState(match: Match) { this.broadcastMatch(match, 'game.state', { match_id: match.id, server_time: Date.now(), players: this.matchPlayers(match), items: this.matchItems(match) }); }
   private broadcastMatch(match: Match, type: string, payload: object) {
     const lobby = this.lobbies.get(match.lobbyId);
     if (lobby) this.broadcast(lobby, type, payload);
@@ -379,7 +592,48 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
     const x = Number(raw.x); const y = Number(raw.y); const z = Number(raw.z);
     return Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z) ? { x, y, z } : undefined;
   }
+  private finiteNumber(value: unknown) { return typeof value === 'number' && Number.isFinite(value) ? value : undefined; }
+  private vectorLength(value: VectorState) { return Math.hypot(value.x, value.y, value.z); }
+  private distance(a: VectorState, b: VectorState) { return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z); }
+  private distanceXZ(a: VectorState, b: VectorState) { return Math.hypot(a.x - b.x, a.z - b.z); }
+  private clampVector(value: VectorState, min: number, max: number): VectorState { return { x: this.clamp(value.x, min, max), y: this.clamp(value.y, min, max), z: this.clamp(value.z, min, max) }; }
   private clamp(value: number, min: number, max: number) { return Math.max(min, Math.min(max, value)); }
+
+  private randomFoodType(): FoodType {
+    const totalWeight = Object.values(FOOD).reduce((sum, food) => sum + food.weight, 0);
+    let roll = randomInt(totalWeight);
+    for (const [foodType, definition] of Object.entries(FOOD) as [FoodType, typeof FOOD[FoodType]][]) {
+      roll -= definition.weight;
+      if (roll < 0) return foodType;
+    }
+    return 'tomato';
+  }
+
+  private randomItemPosition(): VectorState {
+    const angle = Math.random() * Math.PI * 2;
+    const radius = Math.sqrt(Math.random()) * 7;
+    return { x: Math.cos(angle) * radius, y: 9, z: Math.sin(angle) * radius };
+  }
+
+  private createItem(match: Match, foodType = this.randomFoodType(), position = this.randomItemPosition(), pickupDelayMs = 0) {
+    const item: FoodItemState = { id: randomUUID(), foodType, position, pickupAvailableAt: Date.now() + pickupDelayMs, bonked: false };
+    match.items.set(item.id, item);
+    return item;
+  }
+
+  private itemPayload(match: Match, item: FoodItemState) {
+    return { match_id: match.id, item_id: item.id, food_type: item.foodType, position: item.position, pickup_delay_ms: Math.max(0, item.pickupAvailableAt - Date.now()) };
+  }
+
+  private matchItems(match: Match) { return [...match.items.values()].map((item) => this.itemPayload(match, item)); }
+  private broadcastItemSpawn(match: Match, item: FoodItemState) { this.broadcastMatch(match, 'game.item.spawn', this.itemPayload(match, item)); }
+  private projectilePayload(match: Match, projectile: ProjectileState) {
+    return { match_id: match.id, projectile_id: projectile.id, source_id: projectile.sourceId, food_type: projectile.foodType, origin: projectile.origin, velocity: projectile.velocity, knockback_multiplier: projectile.knockbackMultiplier, damage: projectile.damage, aoe: projectile.aoe, server_time: projectile.createdAt };
+  }
+  private removeProjectile(match: Match, projectileId: string) {
+    if (!match.projectiles.delete(projectileId)) return;
+    this.broadcastMatch(match, 'game.projectile.despawn', { match_id: match.id, projectile_id: projectileId });
+  }
 
   private broadcastUpdate(lobby: Lobby) { this.broadcast(lobby, 'lobby.updated', this.lobbyPayload(lobby)); }
   private broadcast(lobby: Lobby, type: string, payload: object) { for (const player of lobby.players.values()) this.send(player, type, payload); }
