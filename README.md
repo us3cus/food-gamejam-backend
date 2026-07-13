@@ -27,4 +27,6 @@ npm start
 
 Поддержаны `session.hello`, `lobby.create`, `lobby.join`, `lobby.settings`, `lobby.ready`, `lobby.leave`, `lobby.invite` и `lobby.start`, а также ответы и рассылки `session.welcome`, `lobby.created`, `lobby.joined`, `lobby.left`, `lobby.updated`, `lobby.started` и `error`.
 
-Сервер буферизует TCP-поток до новой строки, отвергает строки свыше 1 МиБ и ограничивает клиента 30 пакетами в секунду. Состояние лобби хранится в памяти; после старта клиенты получают единые `match_id`, `seed` и настройки матча.
+Сервер буферизует TCP-поток до новой строки, отвергает строки свыше 1 МиБ и ограничивает клиента 30 пакетами в секунду. Состояние лобби хранится в памяти; PvP-лобби рассчитано ровно на двух игроков.
+
+После старта сервер создаёт match из серверного snapshot лобби, назначает игрокам `spawn_slot` и 20 раз в секунду рассылает `game.state`. Поддержаны входящие `game.input`, `game.hit`, `game.round.reset` и исходящие `game.state`, `game.hit`, `game.round.started`, `game.player_left`. Здоровье и перезапуск раунда подтверждаются сервером; сброс раунда может запросить только хост.

@@ -23,13 +23,33 @@ type Lobby = {
   settings: Settings;
   players: Map<string, Player>;
   started: boolean;
+  matchId: string | null;
+};
+type VectorState = { x: number; y: number; z: number };
+type MatchPlayer = {
+  id: string;
+  name: string;
+  spawnSlot: number;
+  position: VectorState;
+  velocity: VectorState;
+  yaw: number;
+  health: number;
+  lastHitAt: number;
+};
+type Match = {
+  id: string;
+  lobbyId: string;
+  hostId: string;
+  players: Map<string, MatchPlayer>;
 };
 
 @Injectable()
 export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TcpGatewayService.name);
   private readonly lobbies = new Map<string, Lobby>();
+  private readonly matches = new Map<string, Match>();
   private server?: Server;
+  private gameTimer?: NodeJS.Timeout;
   readonly port = Number(process.env.TCP_PORT ?? 7778);
   readonly host = process.env.TCP_HOST ?? '127.0.0.1';
 
@@ -38,9 +58,12 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
   onModuleInit() {
     this.server = createServer((socket) => this.handleConnection(socket));
     this.server.listen(this.port, this.host, () => this.logger.log(`TCP lobby server listening on ${this.host}:${this.port}`));
+    this.gameTimer = setInterval(() => this.broadcastGameStates(), 50);
+    this.gameTimer.unref();
   }
 
   onModuleDestroy() {
+    if (this.gameTimer) clearInterval(this.gameTimer);
     this.server?.close();
   }
 
@@ -85,6 +108,9 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
       case 'lobby.invite': return this.invite(player, payload, requestId);
       case 'lobby.start': return this.start(player, payload, requestId);
       case 'lobby.leave': return this.leave(player, payload, requestId);
+      case 'game.input': return this.gameInput(player, payload, requestId);
+      case 'game.hit': return this.gameHit(player, payload, requestId);
+      case 'game.round.reset': return this.resetRound(player, payload, requestId);
       default: return this.fail(player, 'UNKNOWN_TYPE', 'Unknown packet type', requestId);
     }
   }
@@ -100,7 +126,7 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
     const settings = this.validateSettings(this.object(payload.settings) ?? {}, this.defaultSettings());
     if (!settings) return this.fail(player, 'INVALID_SETTINGS', 'Invalid lobby settings', requestId);
 
-    const lobby: Lobby = { id: this.newLobbyId(), hostId: player.id, settings, players: new Map(), started: false };
+    const lobby: Lobby = { id: this.newLobbyId(), hostId: player.id, settings, players: new Map(), started: false, matchId: null };
     lobby.players.set(player.id, player);
     player.lobbyId = lobby.id;
     player.ready = false;
@@ -158,11 +184,88 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
     if (!lobby) return this.fail(player, 'NOT_IN_LOBBY', 'Player is not in this lobby', requestId);
     if (lobby.hostId !== player.id) return this.fail(player, 'NOT_HOST', 'Only the host can start', requestId);
     if (lobby.started) return this.fail(player, 'LOBBY_STARTED', 'Game already started', requestId);
-    if (lobby.players.size < 2) return this.fail(player, 'NOT_ENOUGH_PLAYERS', 'At least two players are required', requestId);
+    if (lobby.players.size !== 2) return this.fail(player, 'INVALID_PLAYER_COUNT', 'PvP requires exactly two players', requestId);
     if ([...lobby.players.values()].some((member) => member.id !== lobby.hostId && !member.ready)) return this.fail(player, 'PLAYERS_NOT_READY', 'All guests must be ready', requestId);
 
     lobby.started = true;
-    this.broadcast(lobby, 'lobby.started', { lobby_id: lobby.id, match_id: randomUUID(), seed: randomInt(0, 2 ** 32), settings: lobby.settings });
+    const match = this.createMatch(lobby);
+    lobby.matchId = match.id;
+    this.matches.set(match.id, match);
+    this.broadcast(lobby, 'lobby.started', {
+      lobby_id: lobby.id,
+      match_id: match.id,
+      host_id: lobby.hostId,
+      seed: randomInt(1, 2_147_483_647),
+      settings: lobby.settings,
+      players: this.matchPlayers(match),
+    });
+    this.broadcastGameState(match);
+  }
+
+  private gameInput(player: Player, payload: Record<string, unknown>, requestId: unknown) {
+    const match = this.matchFor(player, payload.match_id);
+    if (!match) return this.fail(player, 'NOT_IN_MATCH', 'Player is not in this match', requestId);
+    const state = match.players.get(player.id)!;
+    const position = this.vector(payload.position);
+    const velocity = this.vector(payload.velocity);
+    const yaw = Number(payload.yaw);
+    if (!position || !velocity || !Number.isFinite(yaw)) return this.fail(player, 'INVALID_INPUT', 'Invalid player state', requestId);
+    state.position = {
+      x: this.clamp(position.x, -12, 12),
+      y: this.clamp(position.y, -8, 20),
+      z: this.clamp(position.z, -12, 12),
+    };
+    state.velocity = {
+      x: this.clamp(velocity.x, -25, 25),
+      y: this.clamp(velocity.y, -25, 25),
+      z: this.clamp(velocity.z, -25, 25),
+    };
+    state.yaw = this.clamp(yaw, -Math.PI * 4, Math.PI * 4);
+  }
+
+  private gameHit(player: Player, payload: Record<string, unknown>, requestId: unknown) {
+    const match = this.matchFor(player, payload.match_id);
+    if (!match) return this.fail(player, 'NOT_IN_MATCH', 'Player is not in this match', requestId);
+    const source = match.players.get(player.id)!;
+    const targetId = typeof payload.target_id === 'string' ? payload.target_id : '';
+    const target = match.players.get(targetId);
+    const damage = Number(payload.damage);
+    const knockback = this.vector(payload.knockback);
+    if (!target || target.id === source.id || !Number.isInteger(damage) || damage < 1 || damage > 2 || !knockback) {
+      return this.fail(player, 'INVALID_HIT', 'Invalid hit', requestId);
+    }
+    const now = Date.now();
+    if (now - source.lastHitAt < 120 || target.health <= 0) return;
+    source.lastHitAt = now;
+    target.health = Math.max(0, target.health - damage);
+    this.broadcastMatch(match, 'game.hit', {
+      match_id: match.id,
+      source_id: source.id,
+      target_id: target.id,
+      damage,
+      health: target.health,
+      knockback: {
+        x: this.clamp(knockback.x, -20, 20),
+        y: this.clamp(knockback.y, -20, 20),
+        z: this.clamp(knockback.z, -20, 20),
+      },
+    });
+  }
+
+  private resetRound(player: Player, payload: Record<string, unknown>, requestId: unknown) {
+    const match = this.matchFor(player, payload.match_id);
+    if (!match) return this.fail(player, 'NOT_IN_MATCH', 'Player is not in this match', requestId);
+    if (match.hostId !== player.id) return this.fail(player, 'NOT_HOST', 'Only the host can reset the round', requestId);
+    for (const state of match.players.values()) {
+      state.position = this.spawnPosition(state.spawnSlot);
+      state.velocity = { x: 0, y: 0, z: 0 };
+      state.health = 3;
+    }
+    this.broadcastMatch(match, 'game.round.started', {
+      match_id: match.id,
+      reset_match: payload.reset_match === true,
+      players: this.matchPlayers(match),
+    });
   }
 
   private leave(player: Player, payload: Record<string, unknown>, requestId: unknown) {
@@ -178,6 +281,21 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
     player.lobbyId = null;
     player.ready = false;
     if (!lobby) return;
+    if (lobby.matchId) {
+      const match = this.matches.get(lobby.matchId);
+      if (match) this.broadcastMatch(match, 'game.player_left', {
+        match_id: match.id,
+        player_id: player.id,
+        message: 'Второй игрок отключился',
+      });
+      this.matches.delete(lobby.matchId);
+      for (const member of lobby.players.values()) {
+        member.lobbyId = null;
+        member.ready = false;
+      }
+      this.lobbies.delete(lobby.id);
+      return;
+    }
     lobby.players.delete(player.id);
     if (!lobby.players.size) return void this.lobbies.delete(lobby.id);
     if (lobby.hostId === player.id) lobby.hostId = lobby.players.keys().next().value as string;
@@ -195,8 +313,8 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
     const maxPlayers = raw.max_players === undefined ? base.max_players : Number(raw.max_players);
     const roundTime = raw.round_time === undefined ? base.round_time : Number(raw.round_time);
     const winsToMatch = raw.wins_to_match === undefined ? base.wins_to_match : Number(raw.wins_to_match);
-    if (!Number.isInteger(maxPlayers) || maxPlayers < 2 || maxPlayers > 4 || !Number.isInteger(roundTime) || roundTime < 30 || roundTime > 300 || !Number.isInteger(winsToMatch) || winsToMatch < 1 || winsToMatch > 9) return undefined;
-    return { max_players: maxPlayers, round_time: roundTime, wins_to_match: winsToMatch };
+    if (!Number.isInteger(maxPlayers) || maxPlayers !== 2 || !Number.isInteger(roundTime) || roundTime < 30 || roundTime > 300 || !Number.isInteger(winsToMatch) || winsToMatch < 1 || winsToMatch > 9) return undefined;
+    return { max_players: 2, round_time: roundTime, wins_to_match: winsToMatch };
   }
 
   private newLobbyId() {
@@ -208,8 +326,60 @@ export class TcpGatewayService implements OnModuleInit, OnModuleDestroy {
   }
 
   private lobbyPayload(lobby: Lobby) {
-    return { lobby_id: lobby.id, host_id: lobby.hostId, settings: lobby.settings, players: [...lobby.players.values()].map(({ id, name, ready }) => ({ id, name, ready, is_host: id === lobby.hostId })) };
+    const canStart = lobby.players.size === 2 && [...lobby.players.values()].every(({ id, ready }) => id === lobby.hostId || ready);
+    return { lobby_id: lobby.id, host_id: lobby.hostId, settings: lobby.settings, players: [...lobby.players.values()].map(({ id, name, ready }) => ({ id, name, ready: id === lobby.hostId || ready, is_host: id === lobby.hostId })), can_start: canStart };
   }
+
+  private createMatch(lobby: Lobby): Match {
+    const match: Match = { id: randomUUID(), lobbyId: lobby.id, hostId: lobby.hostId, players: new Map() };
+    [...lobby.players.values()].forEach((member, spawnSlot) => match.players.set(member.id, {
+      id: member.id,
+      name: member.name,
+      spawnSlot,
+      position: this.spawnPosition(spawnSlot),
+      velocity: { x: 0, y: 0, z: 0 },
+      yaw: spawnSlot === 0 ? -Math.PI / 2 : Math.PI / 2,
+      health: 3,
+      lastHitAt: 0,
+    }));
+    return match;
+  }
+
+  private matchFor(player: Player, suppliedId: unknown) {
+    if (!player.lobbyId || typeof suppliedId !== 'string') return undefined;
+    const lobby = this.lobbies.get(player.lobbyId);
+    if (!lobby?.started || lobby.matchId !== suppliedId) return undefined;
+    const match = this.matches.get(suppliedId);
+    return match?.players.has(player.id) ? match : undefined;
+  }
+
+  private matchPlayers(match: Match) {
+    return [...match.players.values()].map((state) => ({
+      id: state.id,
+      name: state.name,
+      spawn_slot: state.spawnSlot,
+      spawn: this.spawnPosition(state.spawnSlot),
+      position: state.position,
+      velocity: state.velocity,
+      yaw: state.yaw,
+      health: state.health,
+    }));
+  }
+
+  private broadcastGameStates() { for (const match of this.matches.values()) this.broadcastGameState(match); }
+  private broadcastGameState(match: Match) { this.broadcastMatch(match, 'game.state', { match_id: match.id, server_time: Date.now(), players: this.matchPlayers(match) }); }
+  private broadcastMatch(match: Match, type: string, payload: object) {
+    const lobby = this.lobbies.get(match.lobbyId);
+    if (lobby) this.broadcast(lobby, type, payload);
+  }
+  private spawnPosition(slot: number): VectorState { return { x: slot === 0 ? -4.5 : 4.5, y: 0.1, z: 0 }; }
+  private vector(value: unknown): VectorState | undefined {
+    const raw = this.object(value);
+    if (!raw) return undefined;
+    const x = Number(raw.x); const y = Number(raw.y); const z = Number(raw.z);
+    return Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z) ? { x, y, z } : undefined;
+  }
+  private clamp(value: number, min: number, max: number) { return Math.max(min, Math.min(max, value)); }
 
   private broadcastUpdate(lobby: Lobby) { this.broadcast(lobby, 'lobby.updated', this.lobbyPayload(lobby)); }
   private broadcast(lobby: Lobby, type: string, payload: object) { for (const player of lobby.players.values()) this.send(player, type, payload); }
